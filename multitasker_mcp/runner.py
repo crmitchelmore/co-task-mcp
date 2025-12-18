@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -17,18 +18,41 @@ from .models import RunRequest
 from .state import append_event, load_state, run_dir, save_state, workspace_dir
 
 
+def _notify(title: str, message: str) -> None:
+    """Send a system notification."""
+    if platform.system() == "Darwin":
+        subprocess.run(
+            ["osascript", "-e", f'display notification "{message}" with title "{title}"'],
+            capture_output=True,
+        )
+    # Could add Linux (notify-send) or Windows support here
+
+
+def _start_cleanup_watcher(run_id: str, pr_url: str, workspace_dir: str, repo_path: str) -> None:
+    """Start a detached process to watch for PR merge and cleanup workspace."""
+    import sys
+    subprocess.Popen(
+        [sys.executable, "-m", "multitasker_mcp.cleanup", run_id, pr_url, workspace_dir, repo_path],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+    )
+
+
 @dataclass(frozen=True)
 class CommandSpec:
     cmd: str
     args: list[str]
     model_flag: str | None = None
+    prompt_flag: str | None = None  # None means positional argument
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "commands": {
-        "copilot": {"cmd": "co", "args": [], "model_flag": "--model"},
-        "codex": {"cmd": "cx", "args": []},
-        "claude": {"cmd": "cc", "args": []},
+        "copilot": {"cmd": "copilot", "args": ["--allow-all-tools", "--allow-all-paths"], "model_flag": "--model", "prompt_flag": "-p"},
+        "codex": {"cmd": "codex", "args": ["--dangerously-bypass-approvals-and-sandbox"], "prompt_flag": None},  # positional
+        "claude": {"cmd": "claude", "args": ["--dangerously-skip-permissions", "-p"], "prompt_flag": None},  # -p is print, prompt is positional
     },
     # Best-effort defaults; override in ~/.multitasker/config.json as needed.
     "copilot_models": {
@@ -57,13 +81,15 @@ def _load_config() -> dict[str, Any]:
     return cfg
 
 
-def _resolve_command(agent_cli: str, model_family: str | None) -> list[str]:
+def _resolve_command(agent_cli: str, model_family: str | None) -> tuple[list[str], str | None]:
+    """Returns (base_command, prompt_flag). prompt_flag is None for positional prompt."""
     cfg = _load_config()
     cmd_cfg = cfg["commands"].get(agent_cli) or DEFAULT_CONFIG["commands"][agent_cli]
     spec = CommandSpec(
         cmd=cmd_cfg["cmd"],
         args=list(cmd_cfg.get("args", [])),
         model_flag=cmd_cfg.get("model_flag"),
+        prompt_flag=cmd_cfg.get("prompt_flag"),
     )
 
     cmd = [spec.cmd, *spec.args]
@@ -71,7 +97,7 @@ def _resolve_command(agent_cli: str, model_family: str | None) -> list[str]:
         models = cfg.get("copilot_models", {}).get(model_family) or []
         if models:
             cmd += [spec.model_flag, models[-1]]
-    return cmd
+    return cmd, spec.prompt_flag
 
 
 def _run(cmd: list[str], cwd: Path, log_path: Path) -> int:
@@ -119,33 +145,123 @@ def _format_agent_prompt(req: RunRequest, run_id: str, branch: str) -> str:
     parts.append(
         "You have FULL approval to make changes, run commands, commit, push, open PRs, and enable auto-merge per instructions."
     )
-    parts.append(
-        "If you need human input, emit a single line starting with MULTITASKER_QUESTION: followed by a JSON object with fields: {id,prompt,choices?,needs_user:true}."
-    )
     parts.append("")
     parts.append(f"Run ID: {run_id}")
     parts.append(f"Branch: {branch}")
     parts.append("")
-    parts.append("TASK")
-    parts.append(f"Goal: {req.task.goal}")
-    if req.task.context:
-        parts.append(f"Context: {req.task.context}")
-    if req.task.requirements:
-        parts.append("Requirements:")
-        parts += [f"- {x}" for x in req.task.requirements]
-    if req.task.acceptance_criteria:
-        parts.append("Acceptance criteria:")
-        parts += [f"- {x}" for x in req.task.acceptance_criteria]
+    parts.append("TASK:")
+    parts.append(req.task.goal)
     parts.append("")
-    parts.append("Workflow:")
-    parts.append("- Implement the change.")
-    parts.append("- Run existing tests/linters if present (only what's already in the repo).")
-    parts.append("- Ensure changes are committed to the current branch.")
-    parts.append("- After opening a PR, monitor PR status and address review comments when they make sense, then push updates.")
-    parts.append("- Finish by printing a short human-readable summary of what changed and why.")
-    return "\n".join(parts).strip() + "\n"
+    parts.append("When done, commit your changes, push, and create a PR if requested.")
+    return "\n".join(parts).strip()
 
 
+def _find_newest_session(before_sessions: set[str]) -> str | None:
+    """Find the newest session ID created after before_sessions snapshot."""
+    session_dir = Path.home() / ".copilot" / "session-state"
+    if not session_dir.exists():
+        return None
+    
+    current_sessions = {f.stem for f in session_dir.glob("*.jsonl")}
+    new_sessions = current_sessions - before_sessions
+    
+    if not new_sessions:
+        return None
+    
+    # Return the newest by modification time
+    newest = max(
+        new_sessions,
+        key=lambda s: (session_dir / f"{s}.jsonl").stat().st_mtime
+    )
+    return newest
+
+
+def _get_existing_sessions() -> set[str]:
+    """Get set of existing session IDs."""
+    session_dir = Path.home() / ".copilot" / "session-state"
+    if not session_dir.exists():
+        return set()
+    return {f.stem for f in session_dir.glob("*.jsonl")}
+
+
+def _run_agent(
+    cmd: list[str],
+    cwd: Path,
+    prompt: str,
+    log_path: Path,
+    prompt_flag: str | None = None,
+    resume_session: str | None = None,
+    state_callback: Callable[[], None] | None = None,
+) -> tuple[int, str | None]:
+    """Run agent in non-interactive mode. Returns (exit_code, session_id)."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Snapshot existing sessions to find the new one
+    before_sessions = _get_existing_sessions()
+    
+    # Build command
+    if resume_session:
+        full_cmd = cmd + ["--resume", resume_session]
+    elif prompt_flag:
+        full_cmd = cmd + [prompt_flag, prompt]
+    else:
+        full_cmd = cmd + [prompt]  # positional argument
+    
+    with log_path.open("a", encoding="utf-8") as logfile:
+        if resume_session:
+            logfile.write(f"\n$ {' '.join(cmd)} --resume {resume_session}\n")
+        else:
+            logfile.write(f"\n$ {' '.join(cmd)} {'%s ' % prompt_flag if prompt_flag else ''}'<prompt>'\n")
+        logfile.flush()
+        
+        env = {
+            **os.environ,
+            "GIT_PAGER": "cat",
+            "PAGER": "cat",
+        }
+        
+        logfile.write(f"[Starting process: {' '.join(full_cmd[:3])}...]\n")
+        logfile.flush()
+        
+        process = subprocess.Popen(
+            full_cmd,
+            cwd=str(cwd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env,
+            text=True,
+        )
+        
+        # Store PID for signal handler in worker.py
+        import multitasker_mcp.worker as worker_module
+        worker_module._current_runner_pid = process.pid
+        
+        logfile.write(f"[Process started with PID {process.pid}]\n")
+        logfile.flush()
+        
+        last_output_time = time.time()
+        
+        # Stream output to log file with activity tracking
+        for line in process.stdout:
+            logfile.write(line)
+            logfile.flush()
+            last_output_time = time.time()
+            # Periodic state update callback
+            if state_callback:
+                state_callback()
+        
+        process.wait()
+        
+        logfile.write(f"\n[Process exited with code {process.returncode}]\n")
+        logfile.flush()
+        
+        # Find the session ID that was created/used
+        session_id = resume_session or _find_newest_session(before_sessions)
+        
+        return process.returncode or 0, session_id
+
+
+# Keep the old interactive version for potential future use with Q&A
 def _run_agent_interactive(
     cmd: list[str],
     cwd: Path,
@@ -155,9 +271,9 @@ def _run_agent_interactive(
     on_question: Callable[[dict[str, Any]], str] | None = None,
 ) -> int:
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("ab") as rawlog:
-        rawlog.write(("\n$ " + " ".join(cmd) + "\n").encode("utf-8"))
-        rawlog.flush()
+    with log_path.open("a", encoding="utf-8") as logfile:
+        logfile.write("\n$ " + " ".join(cmd) + "\n")
+        logfile.flush()
 
         child = pexpect.spawn(
             cmd[0],
@@ -173,20 +289,22 @@ def _run_agent_interactive(
             codec_errors="replace",
             timeout=None,
         )
-        child.logfile = rawlog
+        child.logfile = logfile
 
-        child.send(prompt)
+        # Wait for copilot to be ready, then send prompt with newline to submit
+        child.expect([r"Describe a task", r"●", pexpect.TIMEOUT], timeout=30)
+        child.sendline(prompt)
 
-        question_pattern = r"(?m)^MULTITASKER_QUESTION:\\s*(\\{.*\\})\\s*$"
+        question_pattern = r"(?m)^MULTITASKER_QUESTION:\s*(\{.*\})\s*$"
 
         # Best-effort auto-answer for common confirmation prompts.
         auto_patterns = [
-            r"\\(y/n\\)",
-            r"\\(Y/n\\)",
-            r"\\(y/N\\)",
-            r"\\[y/N\\]",
-            r"\\[Y/n\\]",
-            r"Continue\\?",
+            r"\(y/n\)",
+            r"\(Y/n\)",
+            r"\(y/N\)",
+            r"\[y/N\]",
+            r"\[Y/n\]",
+            r"Continue\?",
         ]
 
         while True:
@@ -220,12 +338,18 @@ def run_in_background(run_id: str) -> None:
     wdir = workspace_dir(run_id)
     log_path = rdir / "run.log"
 
+    def is_cancelled() -> bool:
+        return load_state(run_id).get("status") == "cancelled"
+
     def set_status(status: str, **extra: Any) -> None:
         state.update({"status": status, **extra, "updated_at": time.time()})
         save_state(run_id, state)
         append_event(run_id, {"ts": time.time(), "type": "status", "status": status, **extra})
 
     try:
+        if is_cancelled():
+            return
+
         set_status("cloning")
 
         repo_path = wdir / "repo"
@@ -242,6 +366,9 @@ def run_in_background(run_id: str) -> None:
         state["branch"] = branch
         save_state(run_id, state)
 
+        if is_cancelled():
+            return
+
         def on_question(q: dict[str, Any]) -> str:
             qid = str(q.get("id") or f"q_{int(time.time())}")
             state.setdefault("questions", {})[qid] = {**q, "asked_at": time.time()}
@@ -250,6 +377,8 @@ def run_in_background(run_id: str) -> None:
 
             if q.get("needs_user"):
                 set_status("waiting_for_user", question_id=qid)
+                prompt_text = q.get("prompt", "Input needed")[:80]
+                _notify("Multitasker Waiting", f"{run_id}: {prompt_text}")
                 start = time.time()
                 while time.time() - start < 3600:
                     latest = load_state(run_id)
@@ -268,17 +397,46 @@ def run_in_background(run_id: str) -> None:
             return "y"
 
         set_status("running_agent")
-        agent_cmd = _resolve_command(req.agent.cli, req.agent.model_family)
+        agent_cmd, prompt_flag = _resolve_command(req.agent.cli, req.agent.model_family)
         prompt = _format_agent_prompt(req, run_id=run_id, branch=branch)
 
-        rc = _run_agent_interactive(
+        # Check if we have a session to resume
+        resume_session = state.get("agent_session_id")
+        
+        # Callback to update state periodically during agent execution
+        last_update = [time.time()]
+        def update_state_periodically():
+            now = time.time()
+            if now - last_update[0] > 30:  # Update every 30 seconds
+                state["updated_at"] = now
+                save_state(run_id, state)
+                last_update[0] = now
+        
+        rc, session_id = _run_agent(
             agent_cmd,
             cwd=repo_path,
             prompt=prompt,
             log_path=log_path,
-            on_question=on_question,
+            prompt_flag=prompt_flag,
+            resume_session=resume_session,
+            state_callback=update_state_periodically,
         )
-        append_event(run_id, {"ts": time.time(), "type": "agent_exit", "code": rc})
+        
+        # Save session ID for potential resume
+        if session_id:
+            state["agent_session_id"] = session_id
+            save_state(run_id, state)
+        
+        append_event(run_id, {"ts": time.time(), "type": "agent_exit", "code": rc, "session_id": session_id})
+
+        # Check if agent made any commits
+        _, git_log = _run_capture(["git", "log", "--oneline", "-1"], cwd=repo_path, log_path=log_path)
+        has_commits = bool(git_log.strip())
+
+        if rc != 0 and not has_commits:
+            set_status("error", error=f"Agent exited with code {rc} and made no commits", log_tail=_tail(log_path, lines=200), agent_session_id=session_id)
+            _notify("Multitasker Error", f"{run_id} agent failed (code {rc})")
+            return
 
         set_status("creating_pr" if req.pr.create else "finalizing")
 
@@ -302,39 +460,15 @@ def run_in_background(run_id: str) -> None:
                 save_state(run_id, state)
 
             if req.merge.auto and pr_url:
-                merge_cmd = ["gh", "pr", "merge", "--auto", f"--{req.merge.method}", pr_url]
+                merge_cmd = ["gh", "pr", "merge", "--auto", f"--{req.merge.method}"]
+                if not req.merge.require_checks:
+                    merge_cmd.append("--admin")  # bypass checks if not required
+                merge_cmd.append(pr_url)
                 _run(merge_cmd, cwd=repo_path, log_path=log_path)
 
             if pr_url:
-                def monitor() -> None:
-                    start = time.time()
-                    while time.time() - start < 86400:
-                        rc, out = _run_capture(
-                            ["gh", "pr", "view", pr_url, "--json", "state,mergedAt,url"],
-                            cwd=repo_path,
-                            log_path=log_path,
-                        )
-                        if rc == 0:
-                            try:
-                                data = json.loads(out)
-                            except Exception:
-                                data = {}
-                            if data.get("mergedAt") or data.get("state") == "MERGED":
-                                append_event(run_id, {"ts": time.time(), "type": "merged", "url": pr_url})
-                                try:
-                                    shutil.rmtree(wdir)
-                                except Exception:
-                                    pass
-                                state["workspace_cleaned"] = True
-                                save_state(run_id, state)
-                                break
-                        time.sleep(60)
-
-                if req.merge.auto:
-                    set_status("waiting_for_merge", pr_url=pr_url)
-                    monitor()
-                else:
-                    threading.Thread(target=monitor, name=f"monitor-{run_id}", daemon=True).start()
+                # Start a detached cleanup watcher process
+                _start_cleanup_watcher(run_id, pr_url, str(wdir), str(repo_path))
 
         set_status("done")
 
@@ -344,7 +478,12 @@ def run_in_background(run_id: str) -> None:
             "log_tail": _tail(log_path, lines=200),
         }
         save_state(run_id, state)
+        
+        # Notify on completion
+        pr_info = f" - PR: {state.get('pr_url', 'none')}" if req.pr.create else ""
+        _notify("Multitasker Complete", f"{run_id} finished{pr_info}")
 
     except Exception as e:
         set_status("error", error=str(e), log_tail=_tail(log_path, lines=200))
+        _notify("Multitasker Error", f"{run_id} failed: {str(e)[:50]}")
         return

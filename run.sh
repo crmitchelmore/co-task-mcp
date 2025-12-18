@@ -1,3 +1,3 @@
 #!/bin/sh
 set -eu
-.venv/bin/python -m multitasker_mcp.server
+uv run python -m multitasker_mcp.server

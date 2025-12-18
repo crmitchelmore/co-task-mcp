@@ -68,3 +68,7 @@ class AnswerQuestionRequest(BaseModel):
     run_id: str
     question_id: str
     answer: str
+
+
+class CancelRequest(BaseModel):
+    run_id: str

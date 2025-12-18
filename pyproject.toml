@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "multitasker-mcp"
+version = "0.1.0"
+description = "MCP server that delegates coding tasks to CLI agents"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp>=2.14.1",
+    "fastapi>=0.110",
+    "pydantic>=2.0",
+    "pexpect>=4.9",
+]
+
+[project.scripts]
+multitasker-mcp = "multitasker_mcp.server:main"
+
+[tool.setuptools.packages.find]
+include = ["multitasker_mcp*"]

@@ -1,4 +1,0 @@
-fastmcp==2.14.1
-fastapi>=0.110
-pydantic>=2.0
-pexpect>=4.9
